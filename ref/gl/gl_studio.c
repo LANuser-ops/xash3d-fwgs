@@ -112,6 +112,8 @@ typedef struct
 
 	// drawelements renderer
 	vec3_t			arrayverts[MAXSTUDIOVERTS];
+	vec3_t			arraynormal[MAXSTUDIOVERTS];	// world-space normal for per-pixel shader path
+	vec3_t			tnorms[MAXSTUDIOVERTS];		// world-space transformed normal, keyed like lightvalues
 	vec2_t			arraycoord[MAXSTUDIOVERTS];
 	unsigned short	arrayelems[MAXSTUDIOVERTS*6];
 	GLubyte			arraycolor[MAXSTUDIOVERTS][4];
@@ -122,6 +124,7 @@ typedef struct
 // studio-related cvars
 CVAR_DEFINE_AUTO( r_studio_sort_textures, "0", FCVAR_GLCONFIG, "change draw order for additive meshes" );
 CVAR_DEFINE_AUTO( r_studio_drawelements, "1", FCVAR_GLCONFIG, "use glDrawElements for studiomodels" );
+CVAR_DEFINE_AUTO( r_studio_perpixel, "0", FCVAR_ARCHIVE, "experimental: per-pixel GLSL dynamic lighting for studio models (requires r_studio_drawelements 1)" );
 static cvar_t			*cl_righthand = NULL;
 
 static r_studio_interface_t	*pStudioDraw;
@@ -1286,6 +1289,293 @@ static void R_StudioEntityLight( alight_t *lightinfo )
 }
 
 /*
+===============================================================================
+Experimental per-pixel dynamic lighting for studio models (r_studio_perpixel)
+
+Replaces the classic CPU per-vertex Lambert lighting (R_StudioLighting) with a
+GLSL shader that computes lighting per-fragment: one directional "sun" light
+(same ambient/shade/lightvec/lightcolor the engine already provides) plus up
+to MAX_LOCALLIGHTS point lights (elights/dlights) with quadratic falloff and
+a simple specular term.
+
+Model vertices (g_studio.verts) are already baked into WORLD space on the CPU
+(bonestransform includes the entity's origin/angles), so we only need the
+camera's combined view-projection matrix (RI.worldviewProjectionMatrix) - no
+separate per-entity model matrix is required, and normals we upload are also
+already rotated into world space (see the tnorms fill-in below), so no normal
+matrix is needed in the shader either.
+
+This path only covers the common "normal mesh" glDrawElements path. Chrome,
+glowshell and non-array (immediate mode) paths keep using the old CPU model
+until this holds up in practice.
+===============================================================================
+*/
+static const char *studio_vertex_shader =
+"attribute vec3 a_position;			\n"
+"attribute vec3 a_normal;			\n"
+"attribute vec2 a_texcoord;			\n"
+"						\n"
+"uniform mat4 u_mvp;				\n"
+"						\n"
+"varying vec2 v_texcoord;			\n"
+"varying vec3 v_normal;				\n"
+"varying vec3 v_worldpos;			\n"
+"						\n"
+"void main()					\n"
+"{						\n"
+"	v_texcoord = a_texcoord;		\n"
+"	v_normal = a_normal;			\n"
+"	v_worldpos = a_position;		\n"
+"	gl_Position = u_mvp * vec4( a_position, 1.0 );	\n"
+"}						\n";
+
+static const char *studio_fragment_shader =
+"#ifdef GL_ES					\n"
+"precision mediump float;			\n"
+"#endif						\n"
+"						\n"
+"varying vec2 v_texcoord;			\n"
+"varying vec3 v_normal;				\n"
+"varying vec3 v_worldpos;			\n"
+"						\n"
+"uniform sampler2D u_diffuse;			\n"
+"uniform float u_alpha;				\n"
+"						\n"
+"uniform float u_ambient;			\n"
+"uniform float u_shade;				\n"
+"uniform vec3  u_lightDir;			\n"
+"uniform vec3  u_lightColor;			\n"
+"						\n"
+"uniform int   u_numLights;			\n"
+"uniform vec3  u_lightOrigin[4];			\n"
+"uniform vec3  u_lightColorPt[4];			\n"
+"uniform float u_lightRadius[4];			\n"
+"						\n"
+"void main()					\n"
+"{						\n"
+"	vec3 N = normalize( v_normal );		\n"
+"						\n"
+"	// directional \"sun\" light, same convention as the CPU model	\n"
+"	float lambert = max( dot( N, -u_lightDir ), 0.0 );		\n"
+"	vec3 color = u_lightColor * ( u_ambient + u_shade * lambert );	\n"
+"						\n"
+"	for( int i = 0; i < 4; i++ )		\n"
+"	{					\n"
+"		if( i >= u_numLights ) break;	\n"
+"						\n"
+"		vec3 toLight = u_lightOrigin[i] - v_worldpos;	\n"
+"		float dist = length( toLight );	\n"
+"		float atten = clamp( 1.0 - dist / u_lightRadius[i], 0.0, 1.0 );	\n"
+"		atten *= atten;			\n"
+"						\n"
+"		vec3 L = toLight / max( dist, 0.001 );	\n"
+"		float ndotl = max( dot( N, L ), 0.0 );	\n"
+"						\n"
+"		// small specular kick so point lights actually read as \"lights\"	\n"
+"		vec3 V = normalize( -v_worldpos );	\n"
+"		vec3 H = normalize( L + V );	\n"
+"		float spec = pow( max( dot( N, H ), 0.0 ), 16.0 ) * 0.25;	\n"
+"						\n"
+"		color += u_lightColorPt[i] * ( ndotl + spec ) * atten;	\n"
+"	}					\n"
+"						\n"
+"	vec4 tex = texture2D( u_diffuse, v_texcoord );	\n"
+"	gl_FragColor = vec4( tex.rgb * color, tex.a * u_alpha );	\n"
+"}						\n";
+
+typedef struct
+{
+	GLuint	program;
+	GLuint	vshader;
+	GLuint	fshader;
+	qboolean	valid;
+	qboolean	initialized;
+
+	int	a_position;
+	int	a_normal;
+	int	a_texcoord;
+
+	int	u_mvp;
+	int	u_diffuse;
+	int	u_alpha;
+	int	u_ambient;
+	int	u_shade;
+	int	u_lightDir;
+	int	u_lightColor;
+	int	u_numLights;
+	int	u_lightOrigin;
+	int	u_lightColorPt;
+	int	u_lightRadius;
+} studio_shader_t;
+
+static studio_shader_t g_studio_shader;
+
+/*
+===============
+R_StudioCompileShader
+
+compiles a single GLSL stage, prints the info log on failure
+===============
+*/
+static GLuint R_StudioCompileShader( GLenum type, const char *source )
+{
+	GLuint	shader;
+	GLint	compiled = 0;
+
+	shader = pglCreateShaderObjectARB( type );
+	if( !shader )
+		return 0;
+
+	pglShaderSourceARB( shader, 1, &source, NULL );
+	pglCompileShaderARB( shader );
+	pglGetObjectParameterivARB( shader, GL_OBJECT_COMPILE_STATUS_ARB, &compiled );
+
+	if( !compiled )
+	{
+		char	infolog[1024];
+
+		pglGetInfoLogARB( shader, sizeof( infolog ), NULL, infolog );
+		gEngfuncs.Con_Printf( S_ERROR "r_studio_perpixel: %s shader compile failed:\n%s\n",
+			(type == GL_VERTEX_SHADER_ARB) ? "vertex" : "fragment", infolog );
+
+		pglDeleteObjectARB( shader );
+		return 0;
+	}
+
+	return shader;
+}
+
+/*
+===============
+R_StudioInitPerPixelShader
+
+lazily builds the shader program the first time r_studio_perpixel is used.
+sets g_studio_shader.valid = false permanently on failure so we don't retry
+every frame.
+===============
+*/
+static void R_StudioInitPerPixelShader( void )
+{
+	GLint	linked = 0;
+
+	if( g_studio_shader.initialized )
+		return;
+
+	g_studio_shader.initialized = true;
+	g_studio_shader.valid = false;
+
+	if( !GL_Support( GL_SHADER_GLSL100_EXT ))
+	{
+		gEngfuncs.Con_Printf( S_WARN "r_studio_perpixel: GLSL not supported on this device, disabling.\n" );
+		return;
+	}
+
+	g_studio_shader.vshader = R_StudioCompileShader( GL_VERTEX_SHADER_ARB, studio_vertex_shader );
+	g_studio_shader.fshader = R_StudioCompileShader( GL_FRAGMENT_SHADER_ARB, studio_fragment_shader );
+
+	if( !g_studio_shader.vshader || !g_studio_shader.fshader )
+		return;
+
+	g_studio_shader.program = pglCreateProgramObjectARB();
+	pglAttachObjectARB( g_studio_shader.program, g_studio_shader.vshader );
+	pglAttachObjectARB( g_studio_shader.program, g_studio_shader.fshader );
+
+	pglBindAttribLocationARB( g_studio_shader.program, 0, "a_position" );
+	pglBindAttribLocationARB( g_studio_shader.program, 1, "a_normal" );
+	pglBindAttribLocationARB( g_studio_shader.program, 2, "a_texcoord" );
+
+	pglLinkProgramARB( g_studio_shader.program );
+	pglGetObjectParameterivARB( g_studio_shader.program, GL_OBJECT_LINK_STATUS_ARB, &linked );
+
+	if( !linked )
+	{
+		char	infolog[1024];
+
+		pglGetInfoLogARB( g_studio_shader.program, sizeof( infolog ), NULL, infolog );
+		gEngfuncs.Con_Printf( S_ERROR "r_studio_perpixel: link failed:\n%s\n", infolog );
+		return;
+	}
+
+	g_studio_shader.a_position = 0;
+	g_studio_shader.a_normal = 1;
+	g_studio_shader.a_texcoord = 2;
+
+	g_studio_shader.u_mvp          = pglGetUniformLocationARB( g_studio_shader.program, "u_mvp" );
+	g_studio_shader.u_diffuse      = pglGetUniformLocationARB( g_studio_shader.program, "u_diffuse" );
+	g_studio_shader.u_alpha        = pglGetUniformLocationARB( g_studio_shader.program, "u_alpha" );
+	g_studio_shader.u_ambient      = pglGetUniformLocationARB( g_studio_shader.program, "u_ambient" );
+	g_studio_shader.u_shade        = pglGetUniformLocationARB( g_studio_shader.program, "u_shade" );
+	g_studio_shader.u_lightDir     = pglGetUniformLocationARB( g_studio_shader.program, "u_lightDir" );
+	g_studio_shader.u_lightColor   = pglGetUniformLocationARB( g_studio_shader.program, "u_lightColor" );
+	g_studio_shader.u_numLights    = pglGetUniformLocationARB( g_studio_shader.program, "u_numLights" );
+	g_studio_shader.u_lightOrigin  = pglGetUniformLocationARB( g_studio_shader.program, "u_lightOrigin" );
+	g_studio_shader.u_lightColorPt = pglGetUniformLocationARB( g_studio_shader.program, "u_lightColorPt" );
+	g_studio_shader.u_lightRadius  = pglGetUniformLocationARB( g_studio_shader.program, "u_lightRadius" );
+
+	g_studio_shader.valid = true;
+	gEngfuncs.Con_Printf( "r_studio_perpixel: shader compiled OK\n" );
+}
+
+/*
+===============
+R_StudioBeginPerPixelLighting
+
+binds the program and uploads the current frame/light state as uniforms.
+returns false if the shader isn't usable (caller should fall back to CPU path)
+===============
+*/
+static qboolean R_StudioBeginPerPixelLighting( void )
+{
+	vec3_t	lightOrigin[MAX_LOCALLIGHTS];
+	vec3_t	lightColorPt[MAX_LOCALLIGHTS];
+	float	lightRadius[MAX_LOCALLIGHTS];
+	int	i;
+
+	R_StudioInitPerPixelShader();
+
+	if( !g_studio_shader.valid )
+		return false;
+
+	pglUseProgramObjectARB( g_studio_shader.program );
+
+	pglUniformMatrix4fvARB( g_studio_shader.u_mvp, 1, GL_FALSE, &RI.worldviewProjectionMatrix[0][0] );
+	pglUniform1iARB( g_studio_shader.u_diffuse, 0 ); // texture unit 0, same as fixed-function path
+	pglUniform1fARB( g_studio_shader.u_alpha, tr.blend );
+
+	// ambient/shade are stored 0..255 in g_studio, shader wants 0..1
+	pglUniform1fARB( g_studio_shader.u_ambient, g_studio.ambientlight / 255.0f );
+	pglUniform1fARB( g_studio_shader.u_shade, g_studio.shadelight / 255.0f );
+	pglUniform3fARB( g_studio_shader.u_lightDir, g_studio.lightvec[0], g_studio.lightvec[1], g_studio.lightvec[2] );
+	pglUniform3fARB( g_studio_shader.u_lightColor, g_studio.lightcolor[0], g_studio.lightcolor[1], g_studio.lightcolor[2] );
+
+	for( i = 0; i < g_studio.numlocallights && i < MAX_LOCALLIGHTS; i++ )
+	{
+		VectorCopy( g_studio.locallight[i]->origin, lightOrigin[i] );
+		VectorSet( lightColorPt[i],
+			g_studio.locallight[i]->color.r / 255.0f,
+			g_studio.locallight[i]->color.g / 255.0f,
+			g_studio.locallight[i]->color.b / 255.0f );
+		lightRadius[i] = Q_max( g_studio.locallight[i]->radius, 1.0f );
+	}
+
+	pglUniform1iARB( g_studio_shader.u_numLights, i );
+	if( i > 0 )
+	{
+		pglUniform3fvARB( g_studio_shader.u_lightOrigin, i, (float *)lightOrigin );
+		pglUniform3fvARB( g_studio_shader.u_lightColorPt, i, (float *)lightColorPt );
+		pglUniform1fvARB( g_studio_shader.u_lightRadius, i, lightRadius );
+	}
+
+	return true;
+}
+
+static void R_StudioEndPerPixelLighting( void )
+{
+	pglUseProgramObjectARB( 0 );
+}
+
+
+/*
 ===============
 R_StudioSetupLighting
 
@@ -1772,6 +2062,8 @@ static void R_StudioBuildArrayNormalMesh( short *ptricmds, vec3_t *pstudionorms,
 			g_studio.arraycoord[g_studio.numverts][1] = ptricmds[3] * t;
 
 			VectorCopy( g_studio.verts[ptricmds[0]], g_studio.arrayverts[g_studio.numverts] );
+			if( r_studio_perpixel.value )
+				VectorCopy( g_studio.tnorms[ptricmds[1]], g_studio.arraynormal[g_studio.numverts] );
 			g_studio.numverts++;
 		}
 	}
@@ -1877,8 +2169,45 @@ static void R_StudioBuildArrayChromeMesh( short *ptricmds, vec3_t *pstudionorms,
 	}
 }
 
+static void R_StudioDrawArraysShaded( uint startverts, uint startelems )
+{
+	pglEnableVertexAttribArrayARB( g_studio_shader.a_position );
+	pglVertexAttribPointerARB( g_studio_shader.a_position, 3, GL_FLOAT, GL_FALSE, 0, g_studio.arrayverts );
+
+	pglEnableVertexAttribArrayARB( g_studio_shader.a_normal );
+	pglVertexAttribPointerARB( g_studio_shader.a_normal, 3, GL_FLOAT, GL_FALSE, 0, g_studio.arraynormal );
+
+	pglEnableVertexAttribArrayARB( g_studio_shader.a_texcoord );
+	pglVertexAttribPointerARB( g_studio_shader.a_texcoord, 2, GL_FLOAT, GL_FALSE, 0, g_studio.arraycoord );
+
+#if !defined XASH_NANOGL || defined XASH_WES && XASH_EMSCRIPTEN
+	if( pglDrawRangeElements )
+		pglDrawRangeElements( GL_TRIANGLES, startverts, g_studio.numverts,
+			g_studio.numelems - startelems, GL_UNSIGNED_SHORT, &g_studio.arrayelems[startelems] );
+	else
+#endif
+		pglDrawElements( GL_TRIANGLES, g_studio.numelems - startelems, GL_UNSIGNED_SHORT, &g_studio.arrayelems[startelems] );
+
+	pglDisableVertexAttribArrayARB( g_studio_shader.a_position );
+	pglDisableVertexAttribArrayARB( g_studio_shader.a_normal );
+	pglDisableVertexAttribArrayARB( g_studio_shader.a_texcoord );
+}
+
 static void R_StudioDrawArrays( uint startverts, uint startelems )
 {
+	// experimental per-pixel path: only for the plain textured mesh case for now
+	// (chrome/glowshell keep using the CPU-lit fixed-function path below)
+	if( r_studio_perpixel.value && !( g_nForceFaceFlags & STUDIO_NF_CHROME ) )
+	{
+		if( R_StudioBeginPerPixelLighting( ))
+		{
+			R_StudioDrawArraysShaded( startverts, startelems );
+			R_StudioEndPerPixelLighting();
+			return;
+		}
+		// shader unavailable/failed to build - fall through to the classic path below
+	}
+
 	pglEnableClientState( GL_VERTEX_ARRAY );
 	pglVertexPointer( 3, GL_FLOAT, 12, g_studio.arrayverts );
 
@@ -2003,6 +2332,16 @@ static void R_StudioDrawPoints( void )
 				if( FBitSet( g_nFaceFlags, STUDIO_NF_CHROME ))
 					R_StudioSetupChrome( g_studio.chrome[k], *pnormbone, (float *)pstudionorms );
 				VectorScale( g_studio.lightcolor, lv_tmp, g_studio.lightvalues[k] );
+
+				// r_studio_perpixel: also keep a world-space copy of the normal around for the
+				// GLSL path. Cheap enough (one 3x3 rotate) and only runs when the cvar is on.
+				if( r_studio_perpixel.value )
+				{
+					if( FBitSet( m_pStudioHeader->flags, STUDIO_HAS_BONEWEIGHTS ))
+						VectorCopy( g_studio.norms[k], g_studio.tnorms[k] );
+					else
+						Matrix3x4_VectorRotate( g_studio.bonestransform[*pnormbone], (float *)pstudionorms, g_studio.tnorms[k] );
+				}
 			}
 		}
 	}
